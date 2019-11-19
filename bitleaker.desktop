@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Name=BitLeaker for mounting a BitLocker-locked partition
+Comment=BitLeaker for mounting a BitLocker-locked partition
+Exec=sudo -H /home/bitleaker/bitleaker/bitleaker.py
+Path=/home/bitleaker/bitleaker
+Icon=/home/bitleaker/bitleaker/bitleaker_icon2.png
+Terminal=true
+Type=Application
+Categories=Utility;Development;

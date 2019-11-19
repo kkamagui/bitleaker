@@ -1,0 +1,73 @@
+#!/bin/bash
+#
+#                           BitLeaker 
+#                         ------------
+#    Subverting Microsoft's BitLocker with One Vulnerability 
+#
+#               Copyright (C) 2019 Seunghun Han
+#             at the Affiliated Institute of ETRI
+#      Project link: https://github.com/kkamagui/bitleaker
+#
+
+echo "====================================="
+echo "Install packages to build BitLeaker."
+echo "====================================="
+sudo apt install git libtool m4 automake pkg-config autoconf-archive libcurl4-openssl-dev libssl-dev bison flex python cmake libfuse-dev ruby-dev libmbedtls-dev build-essential
+
+echo ""
+echo "========================================="
+echo "Clone TPM2-TSS repository and build it."
+echo "========================================="
+git clone https://github.com/kkamagui/TPM2.0-TSS.git
+cd TPM2.0-TSS
+./bootstrap
+./configure --prefix=/usr
+make -j
+sudo make install
+cd ..
+
+echo ""
+echo "========================================="
+echo "Clone TPM2-tools repository and build it."
+echo "========================================="
+git clone https://github.com/kkamagui/tpm2-tools.git
+cd tpm2-tools
+./bootstrap
+./configure
+make -j
+sudo make install
+cd ..
+
+echo ""
+echo "===================================================="
+echo "Clone customized Dislocker repository and build it."
+echo "===================================================="
+git clone https://github.com/kkamagui/dislocker.git
+cd dislocker
+cmake .
+make -j
+sudo make install
+cd ..
+
+echo ""
+echo "==================================================="
+echo "Clone BitLeaker Bootloader repository and build it."
+echo "==================================================="
+git clone https://github.com/kkamagui/bitleaker-grub.git
+cd bitleaker-grub
+sudo ln -s /usr/include/locale.h /usr/include/xlocale.h
+./autogen.sh
+./configure --target=x86_64 --with-platform=efi
+./build.sh
+sudo ./install.sh
+cd ..
+
+echo ""
+echo "==============================="
+echo "Build BitLeaker kernel module."
+echo "==============================="
+cd bitleaker-kernel-module
+make -j
+cd ..
+
+echo "Finished."
