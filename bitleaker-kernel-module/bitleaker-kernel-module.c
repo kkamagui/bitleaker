@@ -11,7 +11,9 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <asm/text-patching.h>
+#include <asm/io.h>
 #include <linux/kallsyms.h>
+#include <linux/kprobes.h>
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Seunghun Han"); 
@@ -20,6 +22,74 @@ MODULE_DESCRIPTION("Bitleaker kernel module");
 
 #define RESERVED_START	(0x80000)
 #define RESERVED_SIZE	(64 * 1024)
+
+//kallsyms_lookup_name workaround
+
+typedef unsigned long (*kln_p)(const char*);
+
+#define KPROBE_PRE_HANDLER(fname) static int __kprobes fname(struct kprobe *p, struct pt_regs *regs)
+
+long unsigned int kln_addr = 0;
+unsigned long (*kln_pointer)(const char* name) = NULL;
+
+static struct kprobe kp0, kp1;
+
+KPROBE_PRE_HANDLER(handler_pre0) {
+    kln_addr = (--regs->ip);
+
+    return 0;
+}
+
+KPROBE_PRE_HANDLER(handler_pre1) {
+    return 0;
+}
+
+static int do_register_kprobe(struct kprobe* kp, char* symbol_name, void* handler) {
+    int ret;
+
+    kp->symbol_name = symbol_name;
+    kp->pre_handler = handler;
+
+    ret = register_kprobe(kp);
+    if (ret < 0) {
+        pr_err("do_register_kprobe: failed to register for symbol %s, returning %d\n", symbol_name, ret);
+        return ret;
+    }
+
+    pr_info("Planted krpobe for symbol %s at %p\n", symbol_name, kp->addr);
+
+    return ret;
+}
+
+// this is the function that I have modified, as the name suggests it returns a pointer to the extracted kallsyms_lookup_name function
+kln_p get_kln_p(void) {
+    int status;
+
+    status = do_register_kprobe(&kp0, "kallsyms_lookup_name", handler_pre0);
+
+    if (status < 0) return NULL;
+
+    status = do_register_kprobe(&kp1, "kallsyms_lookup_name", handler_pre1);
+
+    if (status < 0) {
+        // cleaning initial krpobe
+        unregister_kprobe(&kp0);
+        return NULL;
+    }
+
+    unregister_kprobe(&kp0);
+    unregister_kprobe(&kp1);
+
+    pr_info("kallsyms_lookup_name address = 0x%lx\n", kln_addr);
+
+    kln_pointer = (unsigned long (*)(const char* name)) kln_addr;
+
+    return kln_pointer;
+}
+
+#define kallsyms_lookup_name(name) (get_kln_p())(name);
+
+//end kallsyms_lookup_name workaround
 
 typedef void *(*TEXT_POKE) (void *addr, const void *opcode, size_t len);
 
@@ -34,7 +104,8 @@ unsigned long g_tpm_suspend_addr;
  */
 void print_banner(void)
 {
-	printk(KERN_INFO "bitleaker:  ▄▄▄▄    ██▓▄▄▄█████▓ ██▓    ▓█████ ▄▄▄       ██ ▄█▀▓█████  ██▀███   \n"); printk(KERN_INFO "bitleaker: ▓█████▄ ▓██▒▓  ██▒ ▓▒▓██▒    ▓█   ▀▒████▄     ██▄█▒ ▓█   ▀ ▓██ ▒ ██▒ \n");
+	printk(KERN_INFO "bitleaker:  ▄▄▄▄    ██▓▄▄▄█████▓ ██▓    ▓█████ ▄▄▄       ██ ▄█▀▓█████  ██▀███   \n");
+	printk(KERN_INFO "bitleaker: ▓█████▄ ▓██▒▓  ██▒ ▓▒▓██▒    ▓█   ▀▒████▄     ██▄█▒ ▓█   ▀ ▓██ ▒ ██▒ \n");
 	printk(KERN_INFO "bitleaker: ▒██▒ ▄██▒██▒▒ ▓██░ ▒░▒██░    ▒███  ▒██  ▀█▄  ▓███▄░ ▒███   ▓██ ░▄█ ▒ \n");
 	printk(KERN_INFO "bitleaker: ▒██░█▀  ░██░░ ▓██▓ ░ ▒██░    ▒▓█  ▄░██▄▄▄▄██ ▓██ █▄ ▒▓█  ▄ ▒██▀▀█▄   \n");
 	printk(KERN_INFO "bitleaker: ░▓█  ▀█▓░██░  ▒██▒ ░ ░██████▒░▒████▒▓█   ▓██▒▒██▒ █▄░▒████▒░██▓ ▒██▒ \n");
@@ -57,7 +128,7 @@ static int dump_event_logs(void)
 	char* start_buffer;
 	int i;
 
-	buffer = (char*) ioremap_nocache(RESERVED_START, RESERVED_SIZE);
+	buffer = (char*) ioremap(RESERVED_START, RESERVED_SIZE);
 	printk(KERN_INFO"bitleaker: \n");
 	printk(KERN_INFO"bitleaker: Dump event logs\n");
 	printk(KERN_INFO"bitleaker: Virtual address %p physical address %p\n", (void*)buffer, (void*)RESERVED_START);
